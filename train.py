@@ -2,51 +2,96 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import os
+import pandas as pd
+import numpy as np
+import csv # 新增导入
+import datetime # 新增导入
 
-# 从 src 导入你整理好的模块
+# 从 src 导入你已经写好的模块
 from src.dataset import MultimodalDataset
 from src.model import BeMambaModel
 from src.utils import calculate_topk_accuracy, calculate_dba_score, calculate_apl
 
-# 针对波束不平衡的 FocalLoss
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0):
-        super(FocalLoss, self).__init__()
+# ==========================================
+# 1. 带动态 Alpha 权重的 FocalLoss
+# ==========================================
+class AlphaFocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super(AlphaFocalLoss, self).__init__()
         self.gamma = gamma
-        self.ce = nn.CrossEntropyLoss(reduction='none')
+        self.alpha = alpha  # alpha 为 [64] 维的 tensor
 
     def forward(self, inputs, targets):
-        log_pt = -self.ce(inputs, targets)
-        pt = torch.exp(log_pt)
-        loss = -((1 - pt) ** self.gamma) * log_pt
-        return loss.mean()
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss) 
+        
+        if self.alpha is not None:
+            at = self.alpha.gather(0, targets)
+        else:
+            at = 1.0
+            
+        focal_loss = at * ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+# ==========================================
+# 2. 动态计算当前场景训练集的波束频率
+# ==========================================
+def calculate_alpha_weights(csv_path, num_classes=64):
+    df = pd.read_csv(csv_path)
+    beams = df['unit1_beam'].values - 1 
+    class_counts = np.bincount(beams, minlength=num_classes)
+    
+    total_samples = len(beams)
+    # 逆频率加权，+1 防止除 0
+    alpha = total_samples / (num_classes * (class_counts + 1))
+    # 归一化，保持 loss 整体量级不崩
+    alpha = alpha / np.mean(alpha)
+    
+    return torch.tensor(alpha, dtype=torch.float32)
+
+# ==========================================
+# 3. 核心训练与评估主循环
+# ==========================================
+
 
 def run_scenario(scenario_name):
     print(f"\n========== 开始训练场景: {scenario_name} ==========")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 路径映射（确保 data_split.py 已将 CSV 生成在 Data/splits/ 下）
-    train_ds = MultimodalDataset(mode='train', scenario_name=scenario_name)
-    val_ds   = MultimodalDataset(mode='val', scenario_name=scenario_name)
-    test_ds  = MultimodalDataset(mode='test', scenario_name=scenario_name)
+    # 路径配置
+    train_csv_path = f"Data/splits/{scenario_name}_train.csv"
+    alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=64).to(device)
+    print("✅ 已生成自适应 Alpha 类别权重。")
     
-    # Batch size 设为 16 或 32，视你的 3090 显存而定
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
-    val_loader   = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=4)
-    test_loader  = DataLoader(test_ds, batch_size=16, shuffle=False, num_workers=4)
+    train_ds = MultimodalDataset(train_csv_path)
+    val_ds   = MultimodalDataset(f"Data/splits/{scenario_name}_val.csv")
+    test_ds  = MultimodalDataset(f"Data/splits/{scenario_name}_test.csv")
+    
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=8)
+    val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=8)
+    test_loader  = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=8)
 
     model = BeMambaModel().to(device)
-    criterion = FocalLoss(gamma=2.0)
+    criterion = AlphaFocalLoss(alpha=alpha_weights, gamma=2.0)
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-2)
 
-    best_dba = 0.0
+    best_val_loss = float('inf') 
     os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("logs", exist_ok=True) # 确保有 logs 文件夹
     
-    epochs = 20 # 先跑 20 轮看看情况
+    # ==========================================
+    # 🌟 新增：初始化日志文件 🌟
+    # ==========================================
+    log_file_path = f"logs/{scenario_name}_train_log.csv"
+    with open(log_file_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'Acc@3', 'DBA', 'APL_dB'])
+    
+    epochs = 50 # 建议开到 50 轮
     for epoch in range(epochs):
-        # --- 训练阶段 ---
+        # --- 训练 ---
         model.train()
-        train_loss = 0.0
+        train_loss_tot = 0.0
         for imgs, radars, lidars, gps, targets, _ in train_loader:
             imgs, radars, lidars, gps, targets = imgs.to(device), radars.to(device), lidars.to(device), gps.to(device), targets.to(device)
             optimizer.zero_grad()
@@ -54,36 +99,50 @@ def run_scenario(scenario_name):
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * targets.size(0)
+            train_loss_tot += loss.item() * targets.size(0)
             
-        # --- 验证阶段 ---
+        # --- 验证 ---
         model.eval()
-        t1_tot, t3_tot, dba_tot, apl_tot = 0.0, 0.0, 0.0, 0.0
+        t1_tot, t3_tot, dba_tot, apl_tot, val_loss_tot = 0.0, 0.0, 0.0, 0.0, 0.0
         with torch.no_grad():
             for imgs, radars, lidars, gps, targets, power_vec in val_loader:
                 imgs, radars, lidars, gps, targets = imgs.to(device), radars.to(device), lidars.to(device), gps.to(device), targets.to(device)
-                
                 outputs = model(imgs, radars, lidars, gps)
                 
-                # 计算指标
-                acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
+                v_loss = criterion(outputs, targets)
                 bs = targets.size(0)
+                val_loss_tot += v_loss.item() * bs
+                
+                acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
                 t1_tot += acc1 * bs
                 t3_tot += acc3 * bs
                 dba_tot += calculate_dba_score(outputs, targets) * bs
-                apl_tot += calculate_apl(outputs, power_vec)
+                apl_tot += calculate_apl(outputs, power_vec) * bs # 注意这里乘了 bs
                 
-        n_val = len(val_ds)
+        n_train, n_val = len(train_ds), len(val_ds)
+        epoch_train_loss = train_loss_tot / n_train
+        epoch_val_loss = val_loss_tot / n_val
         epoch_dba = dba_tot / n_val
-        print(f"Epoch {epoch+1:02d} | L: {train_loss/len(train_ds):.4f} | "
-              f"Acc@3: {t3_tot/n_val:.2f}% | DBA: {epoch_dba:.4f} | APL: {apl_tot/n_val:.4f} dB")
+        epoch_apl = apl_tot / n_val
+        epoch_acc3 = t3_tot / n_val
         
-        if epoch_dba > best_dba:
-            best_dba = epoch_dba
+        print(f"Epoch {epoch+1:02d} | Train L: {epoch_train_loss:.4f} | Val L: {epoch_val_loss:.4f} | Acc@3: {epoch_acc3:.2f}% | DBA: {epoch_dba:.4f} | APL: {epoch_apl:.4f} dB")
+        
+        # ==========================================
+        # 🌟 新增：将当前 Epoch 数据追加写入日志 🌟
+        # ==========================================
+        with open(log_file_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch+1, f"{epoch_train_loss:.4f}", f"{epoch_val_loss:.4f}", f"{epoch_acc3:.2f}", f"{epoch_dba:.4f}", f"{epoch_apl:.4f}"])
+        
+        # 保存模型
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
             torch.save(model.state_dict(), f"checkpoints/best_{scenario_name}.pth")
+            print(f"  --> [Saved Best Model] Val Loss 创新低: {best_val_loss:.4f} (此时 DBA: {epoch_dba:.4f})")
 
     # --- 最终 Test 评估阶段 ---
-    print(f"\n>>> 载入 {scenario_name} 的最佳模型进行最终 Test 评估...")
+    print(f"\n>>> 载入最佳权重进行 Test 评估...")
     model.load_state_dict(torch.load(f"checkpoints/best_{scenario_name}.pth"))
     model.eval()
     
@@ -98,17 +157,24 @@ def run_scenario(scenario_name):
             t1_tot += acc1 * bs
             t3_tot += acc3 * bs
             dba_tot += calculate_dba_score(outputs, targets) * bs
-            apl_tot += calculate_apl(outputs, power_vec)
+            apl_tot += calculate_apl(outputs, power_vec) * bs
             
     n_test = len(test_ds)
-    print(f"\n[Final Results for {scenario_name} Test Set]")
-    print(f"Top-1 Acc: {t1_tot/n_test:.2f}%")
-    print(f"Top-3 Acc: {t3_tot/n_test:.2f}%")
-    print(f"DBA Score: {dba_tot/n_test:.4f}")
-    print(f"APL Loss:  {apl_tot/n_test:.4f} dB\n")
+    final_res = f"""
+[Final Results for {scenario_name} Test Set]
+Top-1 Acc: {t1_tot/n_test:.2f}%
+Top-3 Acc: {t3_tot/n_test:.2f}%
+DBA Score: {dba_tot/n_test:.4f}
+APL Loss:  {apl_tot/n_test:.4f} dB
+"""
+    print(final_res)
+    
+    # 🌟 把最终的 Test 结果也写个 TXT 存起来 🌟
+    with open(f"logs/{scenario_name}_final_test_result.txt", "w") as f:
+        f.write(final_res)
 
 if __name__ == "__main__":
-    # 调用前确保你已经执行了: python src/data_split.py
-    run_scenario("scenario32")
+    # 你随时可以通过修改这里的名字，来分别跑三个单场景
+    # run_scenario("scenario32")
     # run_scenario("scenario33")
-    # run_scenario("scenario34")
+    run_scenario("scenario34")

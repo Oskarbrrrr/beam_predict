@@ -9,12 +9,12 @@ import torch.nn.functional as F
 import open3d as o3d
 
 class MultimodalDataset(Dataset):
-    def __init__(self, mode='train', data_root='./Data/Multi_Modal', split_root='./Data/splits', scenario_name="scenario32"):
+    # === 【修改】：直接接收 csv_path 和 data_root ===
+    def __init__(self, csv_path, data_root='./Data/Multi_Modal'):
         self.data_dir = data_root
         
-        # 读取拆分好的 CSV
-        csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
-        self.df = pd.read_csv(csv_path)
+        # 直接读取传进来的 csv_path，不要再做 os.path.join 拼接了！
+        self.df = pd.read_csv(csv_path) 
         
         self.img_transform = transforms.Compose([
             transforms.Resize((256, 256)),
@@ -22,6 +22,7 @@ class MultimodalDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
+        # 初始化 GPS 归一化参数
         self._init_gps_normalization()
 
     def _init_gps_normalization(self):

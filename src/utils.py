@@ -31,20 +31,44 @@ def calculate_dba_score(output, target, K=3, delta=5):
         return sum(eta_k_list) / K
 
 def calculate_apl(output, power_vectors):
+    """
+    计算 APL (Average Power Loss)
+    衡量预测波束与最佳波束之间的功率损失 (dB)
+    """
     with torch.no_grad():
         _, pred_indices = output.topk(1, 1, True, True)
+        
         loss_list = []
         for i in range(len(pred_indices)):
             pred_idx = pred_indices[i].item()
             p_vec = power_vectors[i].cpu().numpy()
             
-            p_opt = np.max(p_vec)
-            p_pred = p_vec[pred_idx]
+            # === 【终极清洗】: 只要遇到 NaN, Inf, -Inf 全都强制变成 0.0 ===
+            p_vec = np.nan_to_num(p_vec, nan=0.0, posinf=0.0, neginf=0.0)
             
-            p_pred = max(p_pred, 1e-12)
-            p_opt = max(p_opt, 1e-12)
+            p_opt = np.max(p_vec)      
+            p_pred = p_vec[pred_idx]   
             
+            # 如果整条向量的最大值都是 0 (意味着这个样本根本没测到功率，或者是坏数据)
+            # 我们直接记这一次的 Loss 为 0 dB，跳过它的计算，防止干扰平均值
+            if p_opt <= 1e-12:
+                loss_list.append(0.0)
+                continue
+                
+            # 限制极小值防止除 0
+            p_pred = np.clip(p_pred, a_min=1e-12, a_max=None)
+            
+            # 计算功率损失 (dB)
             power_loss = 10 * np.log10(p_opt / p_pred)
+            
+            # 再次以防万一，如果算出来还是 nan，就记为 0
+            if np.isnan(power_loss):
+                power_loss = 0.0
+                
             loss_list.append(power_loss)
             
-        return np.sum(loss_list)
+        # 如果整个 batch 的数据全是坏的，返回 0.0
+        if len(loss_list) == 0:
+            return 0.0
+            
+        return np.mean(loss_list) # 注意：这里改成了 np.mean(loss_list)，之前是 sum
